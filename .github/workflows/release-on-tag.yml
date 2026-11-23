@@ -213,7 +213,7 @@ jobs:
             else
               tag="$IOS_TAG"
               title="i短剧 iOS ${IOS_VERSION}b${IOS_BUILD} (${tag})"
-              install="包内版本为 ${IOS_VERSION} build ${IOS_BUILD}。IPA 未签名（最低 iOS 18），请自行重签侧载。"
+              install="包内版本为 ${IOS_VERSION} build ${IOS_BUILD}。IPA 未签名（最低 iOS 16.0），请自行重签侧载。"
             fi
 
             if [ -n "$NOTES_SRC" ]; then

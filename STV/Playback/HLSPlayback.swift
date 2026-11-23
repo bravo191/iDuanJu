@@ -10,11 +10,49 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
     let headers: [String: String]
     let keyHex: String
     private let queue = DispatchQueue(label: "stv.hls.loader")
-    private let session = URLSession(configuration: .default)
+    /// Shared per process: every loader used to spin up its own URLSession, leaking one per episode.
+    private static let session = URLSession(configuration: .default)
+
+    /// `AVAssetResourceLoader` holds its delegate UNRETAINED and can still invoke it while the
+    /// playback pipeline drains after the coordinator dropped this source — messaging the freed
+    /// delegate ends in SIGSEGV or an escaping exception (std::terminate on stv.hls.loader).
+    /// Self-retain while any request is in flight so the delegate always outlives its callbacks.
+    private let lock = NSLock()
+    private var inflight = 0
+    private var selfKeep: HLSPlayback?
+    private var states: [ObjectIdentifier: RequestState] = [:]
+
+    /// One settle per loading request: whoever runs first (network completion vs didCancel) finishes
+    /// the request and releases the in-flight count; finishLoading on an already-settled request
+    /// throws NSInternalInconsistencyException.
+    private final class RequestState {
+        private let lock = NSLock()
+        private var settled = false
+        func settleOnce() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if settled { return false }
+            settled = true; return true
+        }
+    }
 
     init(headers: [String: String], keyHex: String) {
         self.headers = headers
         self.keyHex = keyHex
+        super.init()
+    }
+
+    private func retainWhileBusy() {
+        lock.lock(); inflight += 1
+        if inflight == 1 { selfKeep = self }
+        lock.unlock()
+    }
+
+    private func settle(_ req: AVAssetResourceLoadingRequest) {
+        lock.lock()
+        states.removeValue(forKey: ObjectIdentifier(req))
+        inflight = max(0, inflight - 1)
+        if inflight == 0 { selfKeep = nil }
+        lock.unlock()
     }
 
     func makeAsset(url: String) -> AVURLAsset? {
@@ -28,8 +66,13 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
     }
 
     func resourceLoader(_ loader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource req: AVAssetResourceLoadingRequest) -> Bool {
-        guard let url = req.request.url, let scheme = url.scheme else { return false }
+        retainWhileBusy()
+        lock.lock(); states[ObjectIdentifier(req)] = RequestState(); lock.unlock()
+        guard let url = req.request.url, let scheme = url.scheme else {
+            settle(req); req.finishLoading(with: URLError(.badURL)); return true
+        }
         if scheme == Self.keyScheme {
+            settle(req)
             guard let key = Bytes.fromHex(keyHex), key.count == 16 else { req.finishLoading(with: URLError(.userAuthenticationRequired)); return true }
             req.contentInformationRequest?.contentType = "public.data"
             req.contentInformationRequest?.contentLength = 16
@@ -38,13 +81,18 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
             req.finishLoading()
             return true
         }
-        guard scheme.hasPrefix(Self.plScheme), var c = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return false }
+        guard scheme.hasPrefix(Self.plScheme), var c = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            settle(req); return false
+        }
         c.scheme = scheme.hasSuffix("-http") ? "http" : "https"
-        guard let real = c.url else { return false }
+        guard let real = c.url else {
+            settle(req); req.finishLoading(with: URLError(.badURL)); return true
+        }
         var r = URLRequest(url: real)
         for (k, v) in headers { r.setValue(v, forHTTPHeaderField: k) }
-        session.dataTask(with: r) { [weak self] data, resp, err in
-            guard let self, let data, err == nil, (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? false else {
+        Self.session.dataTask(with: r) { [weak self] data, resp, err in
+            guard let self, self.settle(req) else { return }
+            guard let data, err == nil, (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? false else {
                 req.finishLoading(with: err ?? URLError(.badServerResponse)); return
             }
             let text = self.rewrite(HLSAdFilter.apply(String(decoding: data, as: UTF8.self), base: real), base: real)
@@ -54,6 +102,11 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
             req.finishLoading()
         }.resume()
         return true
+    }
+
+    func resourceLoader(_ loader: AVAssetResourceLoader, didCancel request: AVAssetResourceLoadingRequest) {
+        // Only release here — the request must not be finished once cancelled.
+        settle(request)
     }
 
     /// Absolutize URIs; nested playlists go back through the loader, keys go to the local key scheme.

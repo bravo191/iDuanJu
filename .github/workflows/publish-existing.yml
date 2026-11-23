@@ -126,7 +126,7 @@ jobs:
             else
               tag="$IOS_TAG"
               title="i短剧 iOS ${IOS_VERSION}b${IOS_BUILD} · $RELEASE_LABEL"
-              install="包内版本为 $IOS_VERSION build $IOS_BUILD，直接发布已验证产物。IPA 未签名，最低 iOS 18，请自行重签侧载。"
+              install="包内版本为 $IOS_VERSION build $IOS_BUILD，直接发布已验证产物。IPA 未签名，最低 iOS 16.0，请自行重签侧载。"
             fi
             cat > "$platform-notes.md" <<EOF
           $title
