@@ -71,14 +71,31 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
     }
 
     func resourceLoader(_ loader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource req: AVAssetResourceLoadingRequest) -> Bool {
-        final class Box { var handled = false }
+        final class Box { var handled = false; var reason: NSString? }
         let box = Box()
-        let clean = HLSGuardExceptions("hls.shouldWait") { [weak self] in
+        let clean = HLSGuardExceptions("hls.shouldWait", &box.reason) { [weak self] in
             guard let self else { return }
             box.handled = self.handleResourceLoader(loader, req: req)
         }
-        if !clean { settle(ObjectIdentifier(req)) }   // idempotent; the body may have settled already
+        if !clean {
+            settle(ObjectIdentifier(req))   // idempotent; the body may have settled already
+            reportFailure(req, tag: "shouldWait", reason: box.reason as String?)
+            return true   // we failed the request ourselves with the diagnostic error
+        }
         return box.handled
+    }
+
+    /// When AVFCore rejects our finish/respond with an exception, fail the request with the
+    /// exception reason so the player error card shows the true cause (finished inside the
+    /// guard — a second rejection cannot escape).
+    private func reportFailure(_ req: AVAssetResourceLoadingRequest, tag: String, reason: String?) {
+        let message = "HLS 加载器异常（\(tag)）：\(reason ?? "unknown")"
+        NSLog("%@", "[HG] " + message)
+        var swallowed: NSString?
+        HLSGuardExceptions("hls.\(tag).finish", &swallowed) {
+            req.finishLoading(with: NSError(domain: "stv.hls.loader", code: 1,
+                                            userInfo: [NSLocalizedDescriptionKey: message]))
+        }
     }
 
     /// Called inside the exception guard: anything thrown here degrades to `handled = false`
@@ -133,7 +150,9 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
         for (k, v) in headers { r.setValue(v, forHTTPHeaderField: k) }
         Self.session.dataTask(with: r) { [weak self] data, resp, err in
             guard let self else { return }
-            let clean = HLSGuardExceptions("hls.completion") {
+            final class Box { var reason: NSString? }
+            let box = Box()
+            let clean = HLSGuardExceptions("hls.completion", &box.reason) {
                 guard self.settle(ObjectIdentifier(req)) else { return }   // didCancel beat us
                 guard !req.isCancelled else { return }
                 guard let data, err == nil, (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? false else {
@@ -147,7 +166,10 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
                 req.dataRequest?.respond(with: Data(text.utf8))
                 self.finish(req, error: nil)
             }
-            if !clean { self.settle(ObjectIdentifier(req)) }   // idempotent
+            if !clean {
+                self.settle(ObjectIdentifier(req))   // idempotent
+                self.reportFailure(req, tag: "completion", reason: box.reason as String?)
+            }
         }.resume()
         return true
     }
