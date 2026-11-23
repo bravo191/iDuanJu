@@ -448,6 +448,11 @@ final class MPVMetalView: UIView {
         guard generation == gen else { throw CancellationError() }
         mounted = true
         refreshTrackLists()
+        // MoltenVK/CAMetalLayer on iOS 16.x can hold the very first frame until the layer is poked
+        // (on device: the picture stays blank after buffering until a small feed drag re-layouts it).
+        // Rebuild the video output once right after mount — the same kick the rotation path uses,
+        // invisible before the first frame, decisive against the stuck layer.
+        scheduleVideoRefit()
     }
 
     private func command(_ args: [String]) {
