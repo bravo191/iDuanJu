@@ -110,10 +110,12 @@ final class MPVMetalView: UIView {
     private var cachedAudioID: Int?
     private var cachedSubtitleID: Int?
     private var isMuted = false
-    /// One VO rebuild per file, fired when playback has actually started advancing — the iOS 16.x
-    /// MoltenVK/CAMetalLayer first-frame stall clears only when the layer is poked at that moment
-    /// (on device: a small feed drag did it; a rebuild at mount time fired too early and did not).
-    private var refitForCurrentFile = false
+    /// iOS 16.x MoltenVK/CAMetalLayer first-frame stall: the first presented frame stays
+    /// un-composited until the Metal layer is MOVED (on device: a small feed drag did it;
+    /// VO rebuilds via vid=no -> restore did not, and destabilized active HLS playback).
+    /// One half-point surface nudge per file, fired when playback starts advancing — mimics
+    /// the user's drag without touching mpv state.
+    private var nudgedForCurrentFile = false
 
     enum Failure: LocalizedError {
         case initFailed, unsupported, timeout, engine(String)
@@ -327,13 +329,25 @@ final class MPVMetalView: UIView {
         switch name {
         case "time-pos":
             cachedTime = max(0, val)
-            if !refitForCurrentFile, val > 0.2 {
-                refitForCurrentFile = true
-                scheduleVideoRefit()
+            if !nudgedForCurrentFile, val > 0.2 {
+                nudgedForCurrentFile = true
+                nudgeSurface()
             }
         case "duration": cachedDuration = max(0, val)
         case "demuxer-cache-time": cachedBuffered = max(0, val)
         default: break
+        }
+    }
+
+    /// Move the Metal surface half a point and snap it back on the next runloop tick — two layer
+    /// transitions that force CoreAnimation to composite, exactly like the user's small drag.
+    private func nudgeSurface() {
+        let view = hostView
+        DispatchQueue.main.async {
+            let f = view.frame
+            guard f.width > 0, f.height > 0 else { return }
+            view.frame = f.offsetBy(dx: 0, dy: 0.5)
+            DispatchQueue.main.async { view.frame = f }
         }
     }
 
@@ -402,7 +416,7 @@ final class MPVMetalView: UIView {
         generation += 1
         let gen = generation
         mounted = false
-        refitForCurrentFile = false
+        nudgedForCurrentFile = false
         cachedWaiting = true
         cachedTime = start ?? 0
         cachedDuration = 0
@@ -458,11 +472,6 @@ final class MPVMetalView: UIView {
         guard generation == gen else { throw CancellationError() }
         mounted = true
         refreshTrackLists()
-        // MoltenVK/CAMetalLayer on iOS 16.x can hold the very first frame until the layer is poked
-        // (on device: the picture stays blank after buffering until a small feed drag re-layouts it).
-        // Rebuild the video output once right after mount — the same kick the rotation path uses,
-        // invisible before the first frame, decisive against the stuck layer.
-        scheduleVideoRefit()
     }
 
     private func command(_ args: [String]) {
