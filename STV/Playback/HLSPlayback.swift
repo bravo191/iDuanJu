@@ -39,16 +39,18 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
         super.init()
     }
 
-    /// Release the in-flight count for a request. Idempotent: only the first call per request
-    /// decrements (matching `accepted` membership), later ones (didCancel after finish, catch
-    /// handlers) are no-ops.
-    private func settle(_ id: ObjectIdentifier) {
+    /// Release the in-flight count for a request. Returns true exactly once per request — the
+    /// first settle (later ones from didCancel after finish, or catch handlers, are no-ops).
+    @discardableResult
+    private func settle(_ id: ObjectIdentifier) -> Bool {
         lock.lock()
-        if unsettled.remove(id) != nil {
+        let wasUnsettled = unsettled.remove(id) != nil
+        if wasUnsettled {
             inflight = max(0, inflight - 1)
             if inflight == 0 { selfKeep = nil }
         }
         lock.unlock()
+        return wasUnsettled
     }
 
     /// Finish a request only while AVFCore still considers it live. The cancellation flag is set
