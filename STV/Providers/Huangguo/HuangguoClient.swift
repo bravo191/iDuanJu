@@ -687,6 +687,9 @@ actor HuangguoClient {
 
     struct LegacyAccess: Codable { var interfaceKey: String; var paramKey: String; var paramIV: String; var token: String; var deviceId: String }
     private var access: LegacyAccess?
+    /// Set when upstream answers 4007/4010 (login throttled / refused): stops the retry button
+    /// from hammering the guest-login endpoint until the upstream window resets.
+    private var loginCooldownUntil: Date?
     private var api: String?
     private var imageCDN: String = "https://zzzznnn.lkkwip.cn"
 
@@ -735,6 +738,10 @@ actor HuangguoClient {
         func val(_ n: String) -> String { HTML.groups("[\"']" + n + "[\"']\\s*[:,]\\s*[\"']([^\"'\\\\\\r\\n]+)[\"']", s)?[1] ?? "" }
         let ik = val("interfaceKey"), pk = val("parameterKey"), piv = val("parameterIv")
         guard !ik.isEmpty, pk.utf8.count == 16, piv.utf8.count == 16 else { throw ProviderError.upstream("黄果官网协议已变化，无法识别当前接口参数") }
+        if let until = loginCooldownUntil, Date() < until {
+            let wait = max(1, Int(until.timeIntervalSinceNow.rounded(.up)))
+            throw ProviderError.upstream("黄果登录限流冷却中（上游 4007/4010），约 \(wait)s 后可重试")
+        }
         let dev = Bytes.hex(Bytes.random(8)).uppercased() + String(Int64(Date().timeIntervalSince1970 * 1000))
         var a = LegacyAccess(interfaceKey: ik, paramKey: pk, paramIV: piv, token: "", deviceId: dev)
         let login = J.dict(try await legacyRequest("POST", "/api/app/mine/login/h5", ["devID": dev, "sysType": "ios", "isAppStore": false], a))
@@ -783,6 +790,12 @@ actor HuangguoClient {
         let env = try J.parse(d)
         let c = J.str(env["code"])
         if !c.isEmpty, c != "200", c != "0" {
+            if c == "4007" || c == "4010" {
+                // Upstream throttles / refuses guest logins (per IP or device); retrying right
+                // away only makes it worse, so park logins for a few minutes.
+                loginCooldownUntil = Date().addingTimeInterval(300)
+                throw ProviderError.upstream("黄果登录过于频繁（\(c)），上游暂时拒绝新登录，请等几分钟后再试")
+            }
             throw ProviderError.upstream("\(c) " + J.str(env["msg"]).replacingOccurrences(of: a.token, with: "[已隐藏]"))
         }
         let hash = env["hash"]
