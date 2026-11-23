@@ -30,12 +30,6 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
         super.init()
     }
 
-    private func retainWhileBusy() {
-        lock.lock(); inflight += 1
-        if inflight == 1 { selfKeep = self }
-        lock.unlock()
-    }
-
     /// Settle a loading request. Returns true exactly once per request — the caller that gets true
     /// may call finishLoading; finishLoading on an already-settled or cancelled request throws
     /// NSInternalInconsistencyException.
@@ -51,6 +45,15 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
         return wasOpen
     }
 
+    /// Finish a request only while AVFCore still considers it live. The cancellation flag is set
+    /// inside AVFCore immediately, while the didCancel callback only queues on our serial queue —
+    /// finishing a cancelled request throws NSInternalInconsistencyException, which escapes the
+    /// dispatch block and kills the process (std::terminate on stv.hls.loader, SIGABRT).
+    private func finish(_ req: AVAssetResourceLoadingRequest, error: Error?) {
+        guard !req.isCancelled else { return }
+        if let error { req.finishLoading(with: error) } else { req.finishLoading() }
+    }
+
     func makeAsset(url: String) -> AVURLAsset? {
         guard var c = URLComponents(string: url) else { return nil }
         let isHLS = url.lowercased().contains(".m3u8") || url.contains("/m3u8/")
@@ -62,19 +65,33 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
     }
 
     func resourceLoader(_ loader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource req: AVAssetResourceLoadingRequest) -> Bool {
-        retainWhileBusy()
-        lock.lock(); openRequests.insert(ObjectIdentifier(req)); lock.unlock()
+        // AVFCore may deliver a request whose cancellation flag is already set (the didCancel
+        // callback only queues later). Touching such a request throws — swallow it; settle() is
+        // once-per-request, so the queued didCancel becomes a no-op.
+        guard !req.isCancelled else { settle(req); return true }
+        lock.lock()
+        let inserted = openRequests.insert(ObjectIdentifier(req)).inserted
+        if inserted {
+            inflight += 1
+            if inflight == 1 { selfKeep = self }
+        }
+        lock.unlock()
+        // Same request object delivered again — refuse to double-handle (double finish throws).
+        guard inserted else { return false }
         guard let url = req.request.url, let scheme = url.scheme else {
-            settle(req); req.finishLoading(with: URLError(.badURL)); return true
+            settle(req); finish(req, error: URLError(.badURL)); return true
         }
         if scheme == Self.keyScheme {
             settle(req)
-            guard let key = Bytes.fromHex(keyHex), key.count == 16 else { req.finishLoading(with: URLError(.userAuthenticationRequired)); return true }
+            guard let key = Bytes.fromHex(keyHex), key.count == 16 else {
+                finish(req, error: URLError(.userAuthenticationRequired)); return true
+            }
+            guard !req.isCancelled else { return true }
             req.contentInformationRequest?.contentType = "public.data"
             req.contentInformationRequest?.contentLength = 16
             req.contentInformationRequest?.isByteRangeAccessSupported = false
             req.dataRequest?.respond(with: Data(key))
-            req.finishLoading()
+            finish(req, error: nil)
             return true
         }
         guard scheme.hasPrefix(Self.plScheme), var c = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
@@ -82,20 +99,22 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
         }
         c.scheme = scheme.hasSuffix("-http") ? "http" : "https"
         guard let real = c.url else {
-            settle(req); req.finishLoading(with: URLError(.badURL)); return true
+            settle(req); finish(req, error: URLError(.badURL)); return true
         }
         var r = URLRequest(url: real)
         for (k, v) in headers { r.setValue(v, forHTTPHeaderField: k) }
         Self.session.dataTask(with: r) { [weak self] data, resp, err in
             guard let self, self.settle(req) else { return }
+            guard !req.isCancelled else { return }
             guard let data, err == nil, (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? false else {
-                req.finishLoading(with: err ?? URLError(.badServerResponse)); return
+                finish(req, error: err ?? URLError(.badServerResponse)); return
             }
+            guard !req.isCancelled else { return }
             let text = self.rewrite(HLSAdFilter.apply(String(decoding: data, as: UTF8.self), base: real), base: real)
             req.contentInformationRequest?.contentType = "public.m3u-playlist"
             req.contentInformationRequest?.contentLength = Int64(text.utf8.count)
             req.dataRequest?.respond(with: Data(text.utf8))
-            req.finishLoading()
+            finish(req, error: nil)
         }.resume()
         return true
     }
