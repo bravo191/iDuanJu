@@ -292,6 +292,16 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         sleepMode = 0
         onSleepTriggered = nil
         save(force: true)
+        // Stop the cores FIRST, while MPNowPlayingSession / AVPictureInPictureController are still
+        // attached. Both observe the player's rate internally, and on iOS 16.x their KVO teardown
+        // can lag their dealloc: releasing them before the final rate change leaves a zombie
+        // observer registered on AVPlayer, and the next setRate (av.stop → pause) faults on it
+        // (_NSKeyValueObservationInfoGetObservances, SIGTRAP/SIGSEGV on leaving the player).
+        // Stopping while attached is the same mutation a normal pause performs, so it is safe.
+        engine.onPlaybackRequested = nil
+        suppliedEngine?.stop()
+        av.stop()
+        mpv?.stop()
         pip?.delegate = nil
         pipObservation = nil
         statusObservation = nil
@@ -319,10 +329,6 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         pipPossible = false
         timer?.invalidate(); timer = nil
         observer = nil
-        engine.onPlaybackRequested = nil
-        suppliedEngine?.stop()
-        av.stop()
-        mpv?.stop()
         readyIndex = nil
         current = nil
         finaleEnded = false
@@ -954,7 +960,9 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         setPaused(failed || interrupted || (readyIndex != nil && engine.isPaused && !engine.isWaiting) ? false : wantsPlayback)
     }
 
-    private func setPaused(_ value: Bool) {
+    /// Explicit pause/play intent (back button pauses before leaving so the pop transition
+    /// runs without MPV property events and the 60 fps danmaku clock still running).
+    func setPaused(_ value: Bool) {
         let wasInterrupted = interrupted
         if !value {
             interrupted = false

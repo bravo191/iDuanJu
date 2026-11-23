@@ -674,6 +674,8 @@ actor HongguoClient {
                 playerRejected.insert(did)
                 if playerIdentity?.deviceId == did { playerIdentity = nil }
                 if attempt == 2 {
+                    playerLastError = "取流被上游空包拒绝，3 个匿名身份均被软拒绝（网络环境或签名被上游识别）"
+                    NSLog("[HG] %@", playerLastError)
                     playerBlockedUntil = Date().addingTimeInterval(30)
                     throw ProviderError.upstream("取流被上游空包拒绝，已尝试 3 个匿名身份，请稍后重试")
                 }
@@ -714,6 +716,9 @@ actor HongguoClient {
     private var playerRejected = Set<String>()
     private var playerBlockedUntil: Date?
     private var playerRegisterAfter = Date.distantPast
+    /// Last identity-registration / resolve failure text, shown alongside the cooldown message
+    /// so a blocked network is diagnosable instead of a bare "cooling down".
+    private var playerLastError = "未注册"
     private var playerTimeOffset: TimeInterval = 0
     private var playerClockAfter = Date.distantPast
 
@@ -752,7 +757,10 @@ actor HongguoClient {
             return saved
         }
         if let task = playerRegistering { return try await task.value }
-        if let until = playerBlockedUntil, Date() < until { throw ProviderError.upstream("播放器设备注册冷却中，请稍后重试") }
+        if let until = playerBlockedUntil, Date() < until {
+            let wait = max(1, Int(until.timeIntervalSinceNow.rounded(.up)))
+            throw ProviderError.upstream("播放器设备注册冷却中，约 \(wait)s 后可重试；上次失败：\(playerLastError)")
+        }
         let session = playerSession
         let task = Task { try await HGPlayerIdentity.register(session: session) }
         playerRegistering = task
@@ -765,6 +773,8 @@ actor HongguoClient {
             playerRegisterAfter = Date().addingTimeInterval(1)
             return id
         } catch {
+            playerLastError = error.localizedDescription
+            NSLog("[HG] player identity register failed: %@", String(describing: error))
             playerBlockedUntil = Date().addingTimeInterval(30)
             throw error
         }

@@ -609,7 +609,7 @@ struct PlayerScreen: View {
     private func portraitControls(_ full: CGSize, ins: EdgeInsets, chrome: Bool, interactive: Bool) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                PlayerIconButton(symbol: "chevron.left", label: "返回") { dismiss() }
+                PlayerIconButton(symbol: "chevron.left", label: "返回") { co.setPaused(true); dismiss() }
                 Spacer()
                 PlayerIconButton(symbol: "pip.enter", label: "画中画") { co.togglePiP() }
                     .disabled(!co.pipPossible).opacity(co.pipPossible ? 1 : 0.55)
@@ -666,7 +666,7 @@ struct PlayerScreen: View {
         let side = max(ins.leading, ins.trailing, 64) + 2
         return VStack(spacing: 0) {
             HStack(spacing: 10) {
-                PlayerIconButton(symbol: "chevron.left", label: "返回") { dismiss() }
+                PlayerIconButton(symbol: "chevron.left", label: "返回") { co.setPaused(true); dismiss() }
                     .opacity(dim).modifier(ChromeFade(on: chrome))
                 if let i = co.current, co.episodes.indices.contains(i) {
                     VStack(alignment: .leading, spacing: 0) {
@@ -769,13 +769,19 @@ struct PlayerScreen: View {
 
     private var moreMenu: some View {
         Menu {
-            Toggle(isOn: $showTech) { Label("技术信息", systemImage: "info.circle") }
-            Toggle(isOn: Binding(get: { co.autoNext }, set: { co.autoNext = $0 })) { Label("自动连播", systemImage: "repeat") }
-            if !series.source.isLongVideo && suppliedDetail == nil {
-                Toggle(isOn: Binding(get: { co.autoNextDrama }, set: {
-                    co.autoNextDrama = $0
-                    showOSD($0 ? "播完连刷推荐：已开启" : "播完连刷推荐：已关闭")
-                })) { Label("播完连刷推荐", systemImage: "sparkles.tv") }
+            // Buttons, not Toggles: on iOS 16.x a `Toggle` (especially one bound through a custom
+            // Binding to ObservableObject state) inside a `Menu` that sits in a continuously
+            // re-evaluated body can spin AttributeGraph's update loop. The spin then blocks the
+            // pop transition, the scene-update watchdog hits its 10 s allowance and iOS kills the
+            // app (0x8BADF00D) when leaving the player. Same UI: checkmark on enabled state.
+            Button { showTech.toggle() } label: {
+                Label("技术信息", systemImage: showTech ? "checkmark" : "info.circle")
+            }
+            Button { co.autoNext.toggle(); showOSD(co.autoNext ? "自动连播：开" : "自动连播：关") } label: {
+                Label("自动连播", systemImage: co.autoNext ? "checkmark" : "repeat")
+            }
+            Button { co.autoNextDrama.toggle(); showOSD(co.autoNextDrama ? "播完连刷推荐：已开启" : "播完连刷推荐：已关闭") } label: {
+                Label("播完连刷推荐", systemImage: co.autoNextDrama ? "checkmark" : "sparkles.tv")
             }
             Menu {
                 ForEach([(0, "关闭"), (1, "标准"), (2, "强效")], id: \.0) { lvl, label in
