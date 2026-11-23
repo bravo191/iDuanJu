@@ -20,20 +20,9 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
     private let lock = NSLock()
     private var inflight = 0
     private var selfKeep: HLSPlayback?
-    private var states: [ObjectIdentifier: RequestState] = [:]
-
-    /// One settle per loading request: whoever runs first (network completion vs didCancel) finishes
-    /// the request and releases the in-flight count; finishLoading on an already-settled request
-    /// throws NSInternalInconsistencyException.
-    private final class RequestState {
-        private let lock = NSLock()
-        private var settled = false
-        func settleOnce() -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            if settled { return false }
-            settled = true; return true
-        }
-    }
+    /// Loading requests we accepted and have not settled yet. Membership IS the once-semantics:
+    /// a request leaves this set exactly once (network completion or didCancel).
+    private var openRequests: Set<ObjectIdentifier> = []
 
     init(headers: [String: String], keyHex: String) {
         self.headers = headers
@@ -47,12 +36,19 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
         lock.unlock()
     }
 
-    private func settle(_ req: AVAssetResourceLoadingRequest) {
+    /// Settle a loading request. Returns true exactly once per request — the caller that gets true
+    /// may call finishLoading; finishLoading on an already-settled or cancelled request throws
+    /// NSInternalInconsistencyException.
+    @discardableResult
+    private func settle(_ req: AVAssetResourceLoadingRequest) -> Bool {
         lock.lock()
-        states.removeValue(forKey: ObjectIdentifier(req))
-        inflight = max(0, inflight - 1)
-        if inflight == 0 { selfKeep = nil }
+        let wasOpen = openRequests.remove(ObjectIdentifier(req)) != nil
+        if wasOpen {
+            inflight = max(0, inflight - 1)
+            if inflight == 0 { selfKeep = nil }
+        }
         lock.unlock()
+        return wasOpen
     }
 
     func makeAsset(url: String) -> AVURLAsset? {
@@ -67,7 +63,7 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
 
     func resourceLoader(_ loader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource req: AVAssetResourceLoadingRequest) -> Bool {
         retainWhileBusy()
-        lock.lock(); states[ObjectIdentifier(req)] = RequestState(); lock.unlock()
+        lock.lock(); openRequests.insert(ObjectIdentifier(req)); lock.unlock()
         guard let url = req.request.url, let scheme = url.scheme else {
             settle(req); req.finishLoading(with: URLError(.badURL)); return true
         }
