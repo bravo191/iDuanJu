@@ -28,6 +28,12 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
             let mp4 = u.path.hasSuffix(".mp4") || u.path.hasPrefix("/tg/")
             return AVPlayerItem(asset: AVURLAsset(url: u, options: mp4 ? mp4AssetOptions() : nil))
         case .remote(let u, let headers):
+            // HLS playlists must not carry the video/mp4 MIME override (iOS 17+).
+            if MPVPlayerEngine.isPlaylist(u) {
+                var o: [String: Any] = [:]
+                if !headers.isEmpty { o["AVURLAssetHTTPHeaderFieldsKey"] = headers }
+                return AVPlayerItem(asset: AVURLAsset(url: u, options: o.isEmpty ? nil : o))
+            }
             return AVPlayerItem(asset: AVURLAsset(url: u, options: mp4AssetOptions(headers: headers)))
         case .stream(let loader, let url):
             return loader.makeAsset(url: url).map { AVPlayerItem(asset: $0) }
@@ -178,6 +184,8 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     private var clockAnchor: (time: Double, at: CFTimeInterval, raw: Double)?
     private var prepared: [Int: Source] = [:]
     private var tasks: [Int: Task<Source, Error>] = [:]
+    /// Resolve-stage notes per episode (e.g. 加密 HLS 未能取到密钥) — surfaced on the failure card.
+    private var resolveNotes: [Int: String] = [:]
     private var observer: Any?
     private var endObserver: NSObjectProtocol?
     private var lastSave = Date.distantPast
@@ -601,6 +609,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
             prepared[k] = nil
             streams[k] = nil
             chosen[k] = nil
+            resolveNotes[k] = nil
         }
         for k in firstFrames.keys where abs(k - i) > 2 {
             firstFrames[k] = nil
@@ -786,9 +795,19 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
             activate(i)
             return
         }
+        // Capture before clearing: the failure card carries stream diagnostics (no syslog on a
+        // user device, so the card is the only surface a reporter can copy from).
+        let stream = chosen[i]
+        let note = resolveNotes[i]
         prepared[i] = nil
         chosen[i] = nil
-        errors[i] = Self.failureText(error)
+        var text = Self.failureText(error)
+        if let s = stream {
+            text += "\n[\(s.kind.rawValue) · 密钥\(s.key.isEmpty ? "未取到" : "已取到(\(s.key.count / 2)B)")" +
+                    (s.url.hasPrefix("stvhls") || s.url.hasPrefix("stvkey") ? "" : "") + "]"
+            if let note, !note.isEmpty { text += " · " + note }
+        }
+        errors[i] = text
         cancelPiPHandover()
     }
 
@@ -845,6 +864,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
                 if let e = r.err, r.streams.isEmpty { throw ProviderError.upstream(e) }
                 guard let best = r.streams.first(where: { $0.id == preferredId }) ?? r.streams.first else { throw ProviderError.upstream("没有可用的视频流") }
                 try Task.checkCancellation()
+                if let note = r.note, !note.isEmpty { resolveNotes[i] = note }
                 self?.streams[i] = r.streams
                 self?.chosen[i] = best
                 stream = best
@@ -876,6 +896,15 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
                 if s.kind == .mp4Clear, !series.source.isLongVideo,
                    let f = EpisodePlaybackLoader.cachedFile(vid: ep.vid, stream: s) {
                     return .file(f)
+                }
+                // Huangguo: Android parity (Huangguo.kt — "ExoPlayer handles variants and AES-128 keys
+                // itself"). Hand AVFoundation the original https playlist with the asset headers and let
+                // it fetch playlist, key (/api/app/vid/sec is public) and segments directly — the iOS
+                // resource-loader rewrite + stvkey:// key delivery fails on iOS 16.x
+                // (CoreMediaErrorDomain -19152). No prebuffer/loopback for these.
+                if series.source == .huangguo, s.kind == .hls || s.kind == .hlsAES,
+                   let u = URL(string: s.url), u.scheme == "http" || u.scheme == "https" {
+                    return .remote(u, s.headers)
                 }
                 let budget = bypass ? 0 : BufferSettings.budget(for: series.source)
                 if budget > 0, let proxied = await self?.prebuffered(s, budget: budget, index: i) { return proxied }
