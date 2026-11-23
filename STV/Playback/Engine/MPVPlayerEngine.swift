@@ -110,6 +110,10 @@ final class MPVMetalView: UIView {
     private var cachedAudioID: Int?
     private var cachedSubtitleID: Int?
     private var isMuted = false
+    /// One VO rebuild per file, fired when playback has actually started advancing — the iOS 16.x
+    /// MoltenVK/CAMetalLayer first-frame stall clears only when the layer is poked at that moment
+    /// (on device: a small feed drag did it; a rebuild at mount time fired too early and did not).
+    private var refitForCurrentFile = false
 
     enum Failure: LocalizedError {
         case initFailed, unsupported, timeout, engine(String)
@@ -321,7 +325,12 @@ final class MPVMetalView: UIView {
 
     private func handleDoubleProp(_ name: String, _ val: Double) {
         switch name {
-        case "time-pos": cachedTime = max(0, val)
+        case "time-pos":
+            cachedTime = max(0, val)
+            if !refitForCurrentFile, val > 0.2 {
+                refitForCurrentFile = true
+                scheduleVideoRefit()
+            }
         case "duration": cachedDuration = max(0, val)
         case "demuxer-cache-time": cachedBuffered = max(0, val)
         default: break
@@ -393,6 +402,7 @@ final class MPVMetalView: UIView {
         generation += 1
         let gen = generation
         mounted = false
+        refitForCurrentFile = false
         cachedWaiting = true
         cachedTime = start ?? 0
         cachedDuration = 0
