@@ -3,6 +3,13 @@ import AVFoundation
 /// Plays huangguo HLS (incl. AES-128) through AVPlayer.
 /// Playlists are fetched through a resourceLoader so we can attach Referer/Origin/X-User-Agent,
 /// and EXT-X-KEY URIs are rewritten to a local scheme that serves the key we already resolved.
+///
+/// AVFCore throws NSInternalInconsistencyException from `finishLoadingWithError:` when a request
+/// is finished twice or after cancellation; the exception escapes the dispatch block on the loader
+/// queue and terminates the process (std::terminate, SIGABRT — see STV-2026-11-23-125006/144458).
+/// Both the synchronous delegate body and the network completion are therefore wrapped in the
+/// Objective-C exception guard (HLSGuardExceptions): whatever AVFCore throws is logged and
+/// swallowed, degrading to a failed load / retry instead of a crash.
 final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
     static let plScheme = "stvhls"
     static let keyScheme = "stvkey"
@@ -15,14 +22,16 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
 
     /// `AVAssetResourceLoader` holds its delegate UNRETAINED and can still invoke it while the
     /// playback pipeline drains after the coordinator dropped this source — messaging the freed
-    /// delegate ends in SIGSEGV or an escaping exception (std::terminate on stv.hls.loader).
-    /// Self-retain while any request is in flight so the delegate always outlives its callbacks.
+    /// delegate would crash. Self-retain while any accepted request is unsettled.
     private let lock = NSLock()
     private var inflight = 0
     private var selfKeep: HLSPlayback?
-    /// Loading requests we accepted and have not settled yet. Membership IS the once-semantics:
-    /// a request leaves this set exactly once (network completion or didCancel).
-    private var openRequests: Set<ObjectIdentifier> = []
+    /// Requests ever accepted — entries are NEVER removed, so a re-delivered request object is
+    /// always refused instead of being handled (and finished) a second time. The set dies with
+    /// the instance; the loader only sees playlists and AES keys, not segments.
+    private var accepted: Set<ObjectIdentifier> = []
+    /// Accepted but not yet settled requests (finished by us or cancelled by AVFCore).
+    private var unsettled: Set<ObjectIdentifier> = []
 
     init(headers: [String: String], keyHex: String) {
         self.headers = headers
@@ -30,25 +39,20 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
         super.init()
     }
 
-    /// Settle a loading request. Returns true exactly once per request — the caller that gets true
-    /// may call finishLoading; finishLoading on an already-settled or cancelled request throws
-    /// NSInternalInconsistencyException.
-    @discardableResult
-    private func settle(_ req: AVAssetResourceLoadingRequest) -> Bool {
+    /// Release the in-flight count for a request. Idempotent: only the first call per request
+    /// decrements (matching `accepted` membership), later ones (didCancel after finish, catch
+    /// handlers) are no-ops.
+    private func settle(_ id: ObjectIdentifier) {
         lock.lock()
-        let wasOpen = openRequests.remove(ObjectIdentifier(req)) != nil
-        if wasOpen {
+        if unsettled.remove(id) != nil {
             inflight = max(0, inflight - 1)
             if inflight == 0 { selfKeep = nil }
         }
         lock.unlock()
-        return wasOpen
     }
 
     /// Finish a request only while AVFCore still considers it live. The cancellation flag is set
-    /// inside AVFCore immediately, while the didCancel callback only queues on our serial queue —
-    /// finishing a cancelled request throws NSInternalInconsistencyException, which escapes the
-    /// dispatch block and kills the process (std::terminate on stv.hls.loader, SIGABRT).
+    /// inside AVFCore immediately, while the didCancel callback only queues on our serial queue.
     private func finish(_ req: AVAssetResourceLoadingRequest, error: Error?) {
         guard !req.isCancelled else { return }
         if let error { req.finishLoading(with: error) } else { req.finishLoading() }
@@ -65,63 +69,90 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
     }
 
     func resourceLoader(_ loader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource req: AVAssetResourceLoadingRequest) -> Bool {
-        // AVFCore may deliver a request whose cancellation flag is already set (the didCancel
-        // callback only queues later). Touching such a request throws — swallow it; settle() is
-        // once-per-request, so the queued didCancel becomes a no-op.
-        guard !req.isCancelled else { settle(req); return true }
+        final class Box { var handled = false }
+        let box = Box()
+        let clean = HLSGuardExceptions("hls.shouldWait") { [weak self] in
+            guard let self else { return }
+            box.handled = self.handleResourceLoader(loader, req: req)
+        }
+        if !clean { settle(ObjectIdentifier(req)) }   // idempotent; the body may have settled already
+        return box.handled
+    }
+
+    /// Called inside the exception guard: anything thrown here degrades to `handled = false`
+    /// (AVFCore fails the request; the player surfaces a retryable error) instead of a crash.
+    private func handleResourceLoader(_ loader: AVAssetResourceLoader, req: AVAssetResourceLoadingRequest) -> Bool {
         lock.lock()
-        let inserted = openRequests.insert(ObjectIdentifier(req)).inserted
-        if inserted {
+        let first = accepted.insert(ObjectIdentifier(req)).inserted
+        if first {
+            unsettled.insert(ObjectIdentifier(req))
             inflight += 1
             if inflight == 1 { selfKeep = self }
         }
         lock.unlock()
-        // Same request object delivered again — refuse to double-handle (double finish throws).
-        guard inserted else { return false }
+        // Same request object delivered again: it was already handled (and finished) once —
+        // never touch it again, a second finishLoading throws.
+        guard first else { return false }
+        // AVFCore may deliver a request whose cancellation flag is already set (the didCancel
+        // callback only queues later). Touching such a request throws — refuse it; settle() is
+        // idempotent, so the queued didCancel becomes a no-op.
+        guard !req.isCancelled else { settle(ObjectIdentifier(req)); return true }
         guard let url = req.request.url, let scheme = url.scheme else {
-            settle(req); finish(req, error: URLError(.badURL)); return true
+            finish(req, error: URLError(.badURL))
+            settle(ObjectIdentifier(req))
+            return true
         }
         if scheme == Self.keyScheme {
-            settle(req)
             guard let key = Bytes.fromHex(keyHex), key.count == 16 else {
-                finish(req, error: URLError(.userAuthenticationRequired)); return true
+                finish(req, error: URLError(.userAuthenticationRequired))
+                settle(ObjectIdentifier(req))
+                return true
             }
-            guard !req.isCancelled else { return true }
+            guard !req.isCancelled else { settle(ObjectIdentifier(req)); return true }
             req.contentInformationRequest?.contentType = "public.data"
             req.contentInformationRequest?.contentLength = 16
             req.contentInformationRequest?.isByteRangeAccessSupported = false
             req.dataRequest?.respond(with: Data(key))
             finish(req, error: nil)
+            settle(ObjectIdentifier(req))
             return true
         }
         guard scheme.hasPrefix(Self.plScheme), var c = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            settle(req); return false
+            settle(ObjectIdentifier(req))
+            return false
         }
         c.scheme = scheme.hasSuffix("-http") ? "http" : "https"
         guard let real = c.url else {
-            settle(req); finish(req, error: URLError(.badURL)); return true
+            finish(req, error: URLError(.badURL))
+            settle(ObjectIdentifier(req))
+            return true
         }
         var r = URLRequest(url: real)
         for (k, v) in headers { r.setValue(v, forHTTPHeaderField: k) }
         Self.session.dataTask(with: r) { [weak self] data, resp, err in
-            guard let self, self.settle(req) else { return }
-            guard !req.isCancelled else { return }
-            guard let data, err == nil, (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? false else {
-                finish(req, error: err ?? URLError(.badServerResponse)); return
+            guard let self else { return }
+            let clean = HLSGuardExceptions("hls.completion") {
+                guard self.settle(ObjectIdentifier(req)) else { return }   // didCancel beat us
+                guard !req.isCancelled else { return }
+                guard let data, err == nil, (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? false else {
+                    self.finish(req, error: err ?? URLError(.badServerResponse))
+                    return
+                }
+                guard !req.isCancelled else { return }
+                let text = self.rewrite(HLSAdFilter.apply(String(decoding: data, as: UTF8.self), base: real), base: real)
+                req.contentInformationRequest?.contentType = "public.m3u-playlist"
+                req.contentInformationRequest?.contentLength = Int64(text.utf8.count)
+                req.dataRequest?.respond(with: Data(text.utf8))
+                self.finish(req, error: nil)
             }
-            guard !req.isCancelled else { return }
-            let text = self.rewrite(HLSAdFilter.apply(String(decoding: data, as: UTF8.self), base: real), base: real)
-            req.contentInformationRequest?.contentType = "public.m3u-playlist"
-            req.contentInformationRequest?.contentLength = Int64(text.utf8.count)
-            req.dataRequest?.respond(with: Data(text.utf8))
-            finish(req, error: nil)
+            if !clean { self.settle(ObjectIdentifier(req)) }   // idempotent
         }.resume()
         return true
     }
 
     func resourceLoader(_ loader: AVAssetResourceLoader, didCancel request: AVAssetResourceLoadingRequest) {
-        // Only release here — the request must not be finished once cancelled.
-        settle(request)
+        // Only settle — a cancelled request must never be finished.
+        settle(ObjectIdentifier(request))
     }
 
     /// Absolutize URIs; nested playlists go back through the loader, keys go to the local key scheme.
