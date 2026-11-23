@@ -1,0 +1,49 @@
+name: build iOS IPA (branch only, no release)
+
+# 按需手动构建 iOS 未签名 IPA：Actions 页选择本 workflow → Run workflow → 选择任意
+# 分支/标签。只编译 iOS（不构建 Android、不发布 Release），IPA 在本次运行的
+# Artifacts（ios-unsigned）里下载。tag 发布仍走 release-on-tag.yml。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    name: build unsigned iOS IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            DerivedDataRelease/SourcePackages
+          key: ${{ runner.os }}-swift-packages-${{ hashFiles('project.yml', 'Packages/**/Package.swift') }}
+          restore-keys: ${{ runner.os }}-swift-packages-
+      - name: Build unsigned IPA
+        env:
+          STV_RUN_TESTS: '0'
+          STV_BUILD_SIMULATOR: '0'
+        run: scripts/package.sh "$RUNNER_TEMP/dist"
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-logs
+          path: ${{ runner.temp }}/dist/logs/*.log
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned
+          path: ${{ runner.temp }}/dist/*.ipa
+          if-no-files-found: error
